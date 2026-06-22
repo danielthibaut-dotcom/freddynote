@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+*.pyo
+OUTPUT_PDF_HIER/
+OUTPUT_TEST/
+*.zip
