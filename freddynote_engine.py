@@ -162,14 +162,26 @@ def midi_to_spelling(midi_note: int, key: str) -> Tuple[str, int, int, str]:
     return step, alter, octave, f"{step}{acc}{octave}"
 
 
+def detect_split_key(rows: List[Dict[str, Any]]) -> str:
+    """Entscheide ob nach 'track' oder 'channel' aufgeteilt wird.
+    Wenn alle Noten auf einem einzigen Track liegen, aber mehrere Channels
+    vorhanden sind, verwenden wir Channel als Spur-Trenner."""
+    tracks = {to_int(r, "track", 0) for r in rows if not (to_bool(r.get("is_drum", False)) or to_int(r, "channel", 0) == 9)}
+    channels = {to_int(r, "channel", 0) for r in rows if not (to_bool(r.get("is_drum", False)) or to_int(r, "channel", 0) == 9)}
+    if len(tracks) <= 1 and len(channels) > 1:
+        return "channel"
+    return "track"
+
+
 def choose_track_auto(rows: List[Dict[str, Any]]) -> Optional[int]:
+    split_key = detect_split_key(rows)
     counts: Dict[int, int] = defaultdict(int)
     for r in rows:
-        track = to_int(r, "track", 0)
+        val = to_int(r, split_key, 0)
         channel = to_int(r, "channel", 0)
         is_drum = to_bool(r.get("is_drum", False)) or channel == 9
         if not is_drum:
-            counts[track] += 1
+            counts[val] += 1
     if not counts:
         return None
     return sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))[0][0]
@@ -201,6 +213,7 @@ def build_notation_model(notes_rows: List[Dict[str, Any]], manifest: Dict[str, A
     source = manifest.get("source", {}) or {}
     source_filename = source.get("filename") or source.get("path") or "unknown.mid"
     title = title or safe_title_from_filename(source_filename)
+    split_key = detect_split_key(notes_rows)
     if track == "auto":
         chosen_track = choose_track_auto(notes_rows)
     elif track in (None, "all", -1):
@@ -218,7 +231,8 @@ def build_notation_model(notes_rows: List[Dict[str, Any]], manifest: Dict[str, A
         tr = to_int(r, "track", 0)
         ch = to_int(r, "channel", 0)
         is_drum = to_bool(r.get("is_drum", False)) or ch == 9
-        if chosen_track is not None and tr != chosen_track:
+        split_val = to_int(r, split_key, 0)
+        if chosen_track is not None and split_val != chosen_track:
             filtered += 1; continue
         if is_drum and not include_drums:
             filtered += 1; continue
@@ -234,7 +248,7 @@ def build_notation_model(notes_rows: List[Dict[str, Any]], manifest: Dict[str, A
         staff = "treble" if midi >= 60 else "bass"
         events.append({
             "note_event_id": to_int(r, "note_event_id", idx),
-            "track": tr, "channel": ch, "is_drum": is_drum,
+            "track": split_val, "channel": ch, "is_drum": is_drum,
             "midi_note": midi, "velocity": to_int(r, "velocity", 0),
             "start_tick": start, "end_tick": end, "duration_ticks": dur,
             "q_start_tick": q_start, "q_end_tick": q_end, "q_duration_ticks": q_dur,
@@ -649,16 +663,32 @@ def write_project_outputs(input_dir: Path, out_dir: Path, *, track: Any = 'auto'
     safe = slugify(model.get('title') or input_dir.name)
     model_path = out_dir / f'{safe}_notation_model.json'
     xml_path = out_dir / f'{safe}_score.musicxml'
-    pdf_path = out_dir / f'{safe}_score.pdf'
     report_path = out_dir / f'{safe}_notation_report.md'
     model_path.write_text(json.dumps(model, indent=2, ensure_ascii=False), encoding='utf-8')
     write_musicxml(model, xml_path)
-    render_pdf(model, pdf_path)
-    write_report(model, report_path, pdf_path.name, xml_path.name)
+
+    tracks_meta = model.get('tracks', [])
+    pdf_names = []
+    if len(tracks_meta) > 1:
+        # Eine PDF pro Spur
+        for tmeta in tracks_meta:
+            tr_no = tmeta['track']
+            tr_label = slugify(tmeta['label'])
+            single_model = build_notation_model(rows, manifest, normalized_path if normalized_path.exists() else None, grid, tr_no, include_drums, title)
+            pdf_path = out_dir / f'{safe}_{tr_label}_score.pdf'
+            render_pdf(single_model, pdf_path)
+            pdf_names.append(pdf_path.name)
+        pdf_path = out_dir / f'{safe}_{slugify(tracks_meta[0]["label"])}_score.pdf'
+    else:
+        pdf_path = out_dir / f'{safe}_score.pdf'
+        render_pdf(model, pdf_path)
+        pdf_names.append(pdf_path.name)
+
+    write_report(model, report_path, ', '.join(pdf_names), xml_path.name)
     manifest_out = {
         'module': 'FREDDYnote', 'module_id': 'FREDDY.MUSIC.NOTATION.FREDDYNOTE.v0_4', 'schema_version': '0.4',
         'created_at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'source': model.get('source', {}), 'title': model.get('title'),
-        'outputs': [model_path.name, xml_path.name, pdf_path.name, report_path.name, 'freddy_notation_manifest.json'],
+        'outputs': [model_path.name, xml_path.name] + pdf_names + [report_path.name, 'freddy_notation_manifest.json'],
         'status': 'success' if model.get('notes') else 'warning_no_notes',
         'renderer': 'dependency_free_builtin_pdf_writer',
         'ollama_backlog': 'All FREDDY components should later be locally orchestrated via OLLAMA.'
